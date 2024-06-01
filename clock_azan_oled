@@ -1,0 +1,203 @@
+#include "RTClib.h"
+#include <LowPower.h>
+
+#include "PrayerTimes.h"
+#include <GyverOLED.h>
+#include <microDS18B20.h>
+
+#define AZAN_DURATION 4
+#define PIN_BUZZER 4
+#define PIN_INTERRUPT 2
+
+#define TEMP_ENABLED
+#define TEMP_READ_INTERVAL_SECOND 30
+
+#define REMINDER_ENABLED
+#define REMINDER_INTERVAL_MINUTE 15
+#define REMINDER_START_HOUR 8
+#define REMINDER_END_HOUR 19
+// #define DEBUG
+
+#ifdef TEMP_ENABLED
+MicroDS18B20<3> sensor;
+#endif
+
+GyverOLED<SSD1306_128x64, OLED_NO_BUFFER> oled;
+
+uint32_t Now, clocktimer;
+boolean flag;
+uint8_t counter = 0;
+
+RTC_DS1307 rtc;
+DateTime now;
+
+double times[sizeof(TimeName) / sizeof(char *)];
+uint16_t nowTMinutes, azanTMinutes;
+uint8_t nowHour, nowMinute, azanHour, azanMinute;
+uint8_t azanIndex = -1;
+bool azanTime = false;
+uint8_t azanCounter = 0;
+
+void p(char *fmt, ...) {
+  char tmp[128];  // resulting string limited to 128 chars
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(tmp, 128, fmt, args);
+  va_end(args);
+  Serial.print(tmp);
+}
+
+void setup() {
+  Serial.begin(9600);
+  digitalWrite(PIN_BUZZER, LOW);
+  pinMode(PIN_BUZZER, OUTPUT);
+
+#ifndef ESP8266
+  while (!Serial)
+    ;  // wait for serial port to connect. Needed for native USB
+#endif
+
+  if (!rtc.begin()) {
+    Serial.println("Couldn't find RTC");
+    Serial.flush();
+    while (1) delay(10);
+  }
+
+  delay(1000);
+  oled.init();
+  Wire.setClock(400000L);  // макс. 800'000
+
+  oled.clear();
+  oled.home();
+
+  oled.setScale(3);
+
+  if (!rtc.isrunning()) {
+    Serial.println("RTC is NOT running, let's set the time!");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  // rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  // rtc.adjust(DateTime(2024, 6, 1, 17, 29, 55));
+
+  rtc.writeSqwPinMode(DS1307_SquareWave1HZ);
+  now = rtc.now();
+  getAzanTime();
+}
+
+uint16_t getTotalMinutes(uint8_t hour, uint8_t minute) {
+  return (hour * 60) + minute;
+}
+
+void getAzanTime() {
+  azanIndex = 99;
+  int dst = 7;
+  uint16_t totalNowMinutes = getTotalMinutes(now.hour(), now.minute());
+  char tmp[10];
+  set_calc_method(ISNA);
+  set_asr_method(Shafii);
+  set_high_lats_adjust_method(AngleBased);
+  set_fajr_angle(20);
+  set_isha_angle(18);
+  float latitude = -6.1043508;
+  float longitude = 106.193384;
+  get_prayer_times(now.year(), now.month(), now.day(), latitude, longitude, dst, times);
+  uint8_t totalTimes = sizeof(times) / sizeof(double);
+  delay(100);
+  for (int i = 0; i < totalTimes; i++) {
+    // Skip sunrise, sunset and midnight
+    if (i == 1 || i == 4 || i == 7) continue;
+    int hours, minutes;
+    get_float_time_parts(times[i], hours, minutes);
+#ifdef DEBUG
+    p("%d \t %10s %s \t %02d:%02d \n\r", i, TimeName[i], dtostrf(times[i], 2, 2, tmp), hours, minutes);
+    delay(150);
+#endif
+
+    uint16_t totalAzanMinutes = getTotalMinutes(hours, minutes);
+    if (totalAzanMinutes > totalNowMinutes) {
+      azanIndex = i;
+    } else if ((i + 1) == 7) {
+      azanIndex = 0;
+      get_float_time_parts(times[0], hours, minutes);
+    }
+    if (azanIndex != 99) {
+      azanHour = hours;
+      azanMinute = minutes;
+      azanTMinutes = getTotalMinutes(hours, minutes);
+      break;
+    }
+  }
+
+#ifdef DEBUG
+  p("NEXT Azan = %d \t %10s %s \t %02d:%02d \n\r", azanIndex, TimeName[azanIndex], dtostrf(times[azanIndex], 2, 2, tmp), azanHour, azanMinute);
+  delay(150);
+#endif
+  attachInterrupt(digitalPinToInterrupt(PIN_INTERRUPT), timerInterrupt, RISING);
+}
+
+void loop() {
+  now = rtc.now();
+
+  char buffer[80];
+  char limitter;
+  if (flag) limitter = ' ';
+  else limitter = ':';
+  flag = !flag;
+
+  sprintf(buffer, "%02d%c%02d", now.hour(), limitter, now.minute());
+
+  oled.home();
+  oled.setScale(3);
+  oled.print(buffer);
+
+#ifdef TEMP_ENABLED
+  if (now.second() % TEMP_READ_INTERVAL_SECOND == 0) {
+    sensor.requestTemp();
+    delay(100);
+    if (sensor.readTemp()) {
+      char tempBuffer[4];
+      dtostrf(sensor.getTemp(), 3, 1, tempBuffer);
+      sprintf(buffer, " %sC", tempBuffer);
+      oled.setScale(1);
+      oled.println(buffer);
+    }
+  }
+#endif
+
+  uint16_t totalNowMinutes = getTotalMinutes(now.hour(), now.minute());
+  bool invalidAzan = azanIndex == 0 && now.hour() > 12;
+
+  if (!azanTime && !invalidAzan && totalNowMinutes >= azanTMinutes) {
+    azanTime = true;
+    azanCounter = 0;
+  }
+
+  sprintf(buffer, "%02d:%02d", azanHour, azanMinute);
+  oled.setScale(1);
+  oled.setCursorXY(95, 13);
+  oled.print(buffer);
+  oled.update();
+
+  if (azanTime && (azanCounter >= AZAN_DURATION)) {
+    azanTime = false;
+    getAzanTime();
+    oled.clear();
+    digitalWrite(PIN_BUZZER, LOW);
+  } else if (azanTime) {
+    azanCounter++;
+    digitalWrite(PIN_BUZZER, flag);
+  }
+#ifdef REMINDER_ENABLED
+  else if (now.second() == 0 && now.minute() % REMINDER_INTERVAL_MINUTE == 0 && now.hour() <= REMINDER_END_HOUR && now.hour() >= REMINDER_START_HOUR) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    delay(300);
+    digitalWrite(PIN_BUZZER, LOW);
+    delay(1000);
+  }
+#endif
+
+  LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
+}
+
+void timerInterrupt() {}
